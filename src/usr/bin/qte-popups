@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""qte-popups: random quick-time event popups on your desktop."""
+import argparse, random, string
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gtk, Gdk, GLib
+
+CSS = b"""
+window.qte { background-color: rgba(15,15,20,0.92); border: 3px solid #f5c542; border-radius: 14px; }
+window.qte.ok { border-color: #3ddc84; }
+window.qte.fail { border-color: #ff4d4d; }
+.title { color: #f5c542; font-size: 14pt; font-weight: bold; letter-spacing: 3px; }
+.key { color: white; font-size: 54pt; font-weight: 900; }
+.sub { color: #bbbbbb; font-size: 11pt; }
+progressbar trough { min-height: 10px; background-color: #333; border-radius: 5px; }
+progressbar progress { min-height: 10px; background-color: #f5c542; border-radius: 5px; }
+window.ok .title, window.ok .key { color: #3ddc84; }
+window.fail .title, window.fail .key { color: #ff4d4d; }
+"""
+
+class QTE(Gtk.Window):
+    def __init__(self, timeout, mash_chance, grab, on_done):
+        super().__init__(type=Gtk.WindowType.TOPLEVEL)
+        self.on_done, self.timeout, self.grab, self.finished = on_done, timeout, grab, False
+        self.mash = random.random() < mash_chance
+        self.key = random.choice(string.ascii_lowercase)
+        self.needed = random.randint(8, 14) if self.mash else 1
+        self.presses = 0
+        self.timeout_ms = int(timeout * 1000 * (2 if self.mash else 1))
+        self.elapsed = 0
+
+        self.set_decorated(False)
+        self.set_keep_above(True)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_resizable(False)
+        self.set_default_size(260, 230)
+        self.get_style_context().add_class("qte")
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=18)
+        self.title = Gtk.Label(label="MASH!" if self.mash else "PRESS!")
+        self.title.get_style_context().add_class("title")
+        self.keylbl = Gtk.Label(label=self.key.upper())
+        self.keylbl.get_style_context().add_class("key")
+        self.sub = Gtk.Label(label=self._sub())
+        self.sub.get_style_context().add_class("sub")
+        self.bar = Gtk.ProgressBar()
+        self.bar.set_fraction(1.0)
+        for w in (self.title, self.keylbl, self.sub, self.bar):
+            box.pack_start(w, False, False, 0)
+        self.add(box)
+
+        self.connect("key-press-event", self.on_key)
+        self.connect("button-press-event", lambda *a: self.finish(False))
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+
+        # random spot inside the primary monitor's usable area
+        mon = Gdk.Display.get_default().get_primary_monitor() or Gdk.Display.get_default().get_monitor(0)
+        a = mon.get_workarea()
+        self.move(random.randint(a.x, max(a.x, a.x + a.width - 280)),
+                  random.randint(a.y, max(a.y, a.y + a.height - 250)))
+        self.show_all()
+        self.present_with_time(Gdk.CURRENT_TIME)
+        if grab:
+            GLib.idle_add(self._grab)
+        self.tick_id = GLib.timeout_add(30, self.tick)
+
+    def _sub(self):
+        return f"{self.presses}/{self.needed}" if self.mash else "quick!"
+
+    def _grab(self):
+        try:
+            seat = Gdk.Display.get_default().get_default_seat()
+            seat.grab(self.get_window(), Gdk.SeatCapabilities.KEYBOARD, True, None, None, None, None)
+        except Exception:
+            pass
+        return False
+
+    def tick(self):
+        if self.finished:
+            return False
+        self.elapsed += 30
+        self.bar.set_fraction(max(0.0, 1 - self.elapsed / self.timeout_ms))
+        if self.elapsed >= self.timeout_ms:
+            self.finish(False)
+            return False
+        return True
+
+    def on_key(self, _w, ev):
+        if self.finished:
+            return True
+        name = (Gdk.keyval_name(ev.keyval) or "").lower()
+        if name == "escape":
+            self.finish(False)
+        elif name == self.key:
+            self.presses += 1
+            self.sub.set_text(self._sub())
+            if self.presses >= self.needed:
+                self.finish(True)
+        elif not self.mash and len(name) == 1:
+            self.finish(False)   # wrong key = fail, just like the games
+        return True
+
+    def finish(self, success):
+        if self.finished:
+            return
+        self.finished = True
+        ctx = self.get_style_context()
+        ctx.add_class("ok" if success else "fail")
+        self.title.set_text("NICE!" if success else "FAILED")
+        self.keylbl.set_text("✔" if success else "✘")
+        self.sub.set_text("")
+        self.bar.hide()
+        try:
+            Gdk.Display.get_default().get_default_seat().ungrab()
+        except Exception:
+            pass
+        GLib.timeout_add(700, self._close)
+
+    def _close(self):
+        self.destroy()
+        self.on_done()
+        return False
+
+class App:
+    def __init__(self, a):
+        self.a = a
+        self.active = None
+        self.schedule()
+
+    def schedule(self):
+        GLib.timeout_add_seconds(random.randint(self.a.min_interval, self.a.max_interval), self.spawn)
+
+    def spawn(self):
+        if self.active is None:
+            self.active = QTE(self.a.timeout, self.a.mash_chance, not self.a.no_grab, self.done)
+        return False
+
+    def done(self):
+        self.active = None
+        self.schedule()
+
+def main():
+    p = argparse.ArgumentParser(description="Random quick-time event popups.")
+    p.add_argument("--min-interval", type=int, default=120, help="min seconds between popups (default 120)")
+    p.add_argument("--max-interval", type=int, default=900, help="max seconds between popups (default 900)")
+    p.add_argument("--timeout", type=float, default=2.0, help="seconds to react (default 2.0)")
+    p.add_argument("--mash-chance", type=float, default=0.25, help="chance of a mash-the-key event, 0-1")
+    p.add_argument("--no-grab", action="store_true", help="don't grab the keyboard (window needs focus instead)")
+    p.add_argument("--now", action="store_true", help="fire the first popup after 2 seconds (for testing)")
+    a = p.parse_args()
+    a.max_interval = max(a.min_interval, a.max_interval)
+
+    css = Gtk.CssProvider(); css.load_from_data(CSS)
+    Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css,
+                                             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    app = App.__new__(App); app.a, app.active = a, None
+    if a.now:
+        GLib.timeout_add_seconds(2, app.spawn)
+    else:
+        app.schedule()
+    Gtk.main()
+
+if __name__ == "__main__":
+    main()
